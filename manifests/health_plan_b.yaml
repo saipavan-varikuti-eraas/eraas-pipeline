@@ -1,0 +1,36 @@
+tenant_id: health_plan_b
+display_name: "Health Plan B"
+
+source:
+  type: csv
+  path: "./source/airquality_emblem-health_input_patients_combined_with_latlng.csv"
+  lat_field: lat
+  lng_field: lng
+
+enrich:
+  source: api
+  grid_precision: 2
+  wildfire_radius_km: 50
+  ili_horizon_days: 14
+  ili_max_drift_km: 50
+  weather_horizon_days: 7
+  cold_threshold_f: 32
+  heat_threshold_f: 100
+  providers:
+    ambee:
+      base_url: "https://api.ambeedata.com"
+      api_key_env: AMBEE_API_KEY
+    visual_crossing:
+      base_url: "https://weather.visualcrossing.com/VisualCrossingWebServices/rest/services"
+      api_key_env: VISUAL_CROSSING_API_KEY
+      unit_group: us
+      include: "days,current"
+  hazards:
+    air_quality: { provider: ambee,           path: "/latest/by-lat-lng" }
+    pollen:      { provider: ambee,           path: "/latest/pollen/by-lat-lng" }
+    wildfire:    { provider: ambee,           path: "/fire/latest/by-lat-lng" }
+    ili:         { provider: ambee,           path: "/ili/forecast/by-lat-lng" }
+    weather:     { provider: visual_crossing, path: "/timeline/{location}" }
+
+schedule:
+  cron: "0 4 * * *"
