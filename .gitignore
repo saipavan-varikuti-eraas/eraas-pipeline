@@ -4,3 +4,6 @@ data/
 .venv/
 __pycache__/
 *.pyc
+.DS_Store
+dump.rb.DS_Store
+dump.rdb
