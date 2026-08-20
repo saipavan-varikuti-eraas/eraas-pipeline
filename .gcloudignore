@@ -1,0 +1,9 @@
+.git/
+__pycache__/
+*.pyc
+.venv/
+venv/
+__MACOSX/
+data/
+dump.rdb
+.env

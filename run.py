@@ -32,6 +32,13 @@ def main(manifest_path):
     for name, (n, path) in written.items():
         print(f"  {name:12s} {n:5d} rows -> {path}")
     raw_patients = pd.read_csv(manifest["source"]["path"]).to_dict("records")
+    
+    # Upload raw to GCS
+    try:
+        from pipeline.gcs_storage import upload_raw
+        upload_raw(manifest)
+    except Exception as e:
+        print(f"  GCS raw upload skipped: {e}")
 
     # STAGE 2
     hr("STAGE 2  ENRICH")
@@ -97,6 +104,13 @@ def main(manifest_path):
 
     close()
 
+        # Upload scored to GCS
+    try:
+        from pipeline.gcs_storage import upload_scored
+        upload_scored(scored, env_by_cell, manifest)
+    except Exception as e:
+        print(f"  GCS scored upload skipped: {e}")
+    
     # SUMMARY
     hr("PIPELINE COMPLETE")
     print(f"  tenant:      {tid}")

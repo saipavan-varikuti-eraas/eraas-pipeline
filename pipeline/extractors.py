@@ -135,50 +135,125 @@ def _wildfire(resp, lat, lng, cfg):
     return out
 
 
+# Numeric <-> category mapping so both Ambee schemas normalize to the same
+# fields. Old schema gives a category string ("Low"); new schema gives an int
+# ili_risk (1..) plus ili_risk_category. We always emit BOTH.
+_ILI_CAT_TO_NUM = {"Low": 1, "Moderate": 2, "High": 3, "Very High": 4}
+_ILI_NUM_TO_CAT = {v: k for k, v in _ILI_CAT_TO_NUM.items()}
+
+
+def _ili_detect_format(resp, rows):
+    """Return 'new' (weekly CBSA / epi_week / int risk) or 'old' (daily /
+    createdAt / string risk). Ambee migrated schemas ~Aug 2026; cache and
+    possibly live responses contain both, so the extractor handles either."""
+    if not rows:
+        return "empty"
+    r0 = rows[0]
+    if "epi_week_start_date" in r0 or resp.get("resolution") == "CBSA":
+        return "new"
+    if "createdAt" in r0:
+        return "old"
+    return "unknown"
+
+
+def _ili_series_new(resp, rows):
+    """Normalize new weekly CBSA format -> list of (date, num, category)."""
+    series = []
+    for r in rows:
+        ds = r.get("epi_week_start_date")
+        if not ds:
+            continue
+        dt = datetime.fromisoformat(ds.replace("Z", "+00:00"))
+        num = r.get("ili_risk")
+        cat = r.get("ili_risk_category") or _ILI_NUM_TO_CAT.get(num)
+        if num is None and cat in _ILI_CAT_TO_NUM:
+            num = _ILI_CAT_TO_NUM[cat]
+        series.append((dt, num, cat))
+    return series
+
+
+def _ili_series_old(rows):
+    """Normalize old daily string format -> list of (date, num, category)."""
+    series = []
+    for r in rows:
+        ds = r.get("createdAt")
+        risk = r.get("ili_risk")
+        if not ds or risk is None:
+            continue
+        dt = datetime.fromisoformat(ds.replace("Z", "+00:00"))
+        # old risk is a category string
+        cat = risk if isinstance(risk, str) else _ILI_NUM_TO_CAT.get(risk)
+        num = _ILI_CAT_TO_NUM.get(cat) if cat else (risk if isinstance(risk, int) else None)
+        series.append((dt, num, cat))
+    return series
+
+
 def _ili(resp, lat, lng, cfg):
-    """Envelope: {message, data:[daily forecast]} — a time series."""
+    """Ambee ILI — handles BOTH the old daily/string schema and the new
+    weekly CBSA/int schema. Emits canonical scalar fields for the location
+    snapshot AND the full normalized weekly series (ili_series) for the
+    time-series export. Keeps the 50km drift gate; carries CBSA when present.
+    """
     horizon = cfg.get("ili_horizon_days", 14)
     max_drift = cfg.get("ili_max_drift_km", 50)
-    out = {"ili_risk_today": None, "ili_risk_peak": None,
-           "ili_peak_date": None, "ili_horizon_days": horizon,
-           "ili_grid_drift_km": None, "ili_usable": None,
-           "ili_reject_reason": None}
-    rows = (resp or {}).get("data") or []
-    if not rows:
+    out = {"ili_risk_today": None, "ili_risk_today_num": None,
+           "ili_risk_peak": None, "ili_peak_date": None,
+           "ili_horizon_days": horizon, "ili_grid_drift_km": None,
+           "ili_usable": None, "ili_reject_reason": None,
+           "ili_cbsa_id": None, "ili_cbsa_name": None,
+           "ili_schema": None, "ili_series": []}
+    resp = resp or {}
+    rows = resp.get("data") or []
+    fmt = _ili_detect_format(resp, rows)
+    out["ili_schema"] = fmt
+    if fmt in ("empty", "unknown"):
+        if fmt == "unknown":
+            out["ili_reject_reason"] = "unrecognized ILI response schema"
         return out
 
-    r0 = rows[0]
-    if r0.get("lat") is not None:
-        drift = round(haversine_km(lat, lng, r0["lat"], r0["lng"]), 2)
+    # CBSA label (new schema only carries it explicitly)
+    out["ili_cbsa_id"] = resp.get("cbsa_id")
+    out["ili_cbsa_name"] = resp.get("cbsa_name")
+
+    # ---- drift gate --------------------------------------------------------
+    # New schema: coords at top level. Old schema: coords repeated per row.
+    ref_lat = resp.get("lat")
+    ref_lng = resp.get("lng")
+    if ref_lat is None and rows:
+        ref_lat, ref_lng = rows[0].get("lat"), rows[0].get("lng")
+    if ref_lat is not None and ref_lng is not None:
+        drift = round(haversine_km(lat, lng, ref_lat, ref_lng), 2)
         out["ili_grid_drift_km"] = drift
         if drift > max_drift:
             out["ili_usable"] = False
             out["ili_reject_reason"] = f"grid drift {drift}km > {max_drift}km limit"
             return out
         out["ili_usable"] = True
+    else:
+        # no coords to check — mark usable but note the gate couldn't run
+        out["ili_usable"] = True
+        out["ili_reject_reason"] = "no coords in response; drift gate skipped"
 
-    parsed = []
-    for r in rows:
-        if not r.get("createdAt") or not r.get("ili_risk"):
-            continue
-        dt = datetime.fromisoformat(r["createdAt"].replace("Z", "+00:00"))
-        parsed.append((dt, r["ili_risk"]))
-    if not parsed:
+    # ---- normalize series --------------------------------------------------
+    series = _ili_series_new(resp, rows) if fmt == "new" else _ili_series_old(rows)
+    series = [(d, n, c) for d, n, c in series if n is not None]
+    if not series:
         return out
-    parsed.sort()
+    series.sort()
+
+    # expose the full series for the export (ISO date, num, category)
+    out["ili_series"] = [(d.date().isoformat(), n, c) for d, n, c in series]
 
     now = datetime.now(timezone.utc)
-    within = [(d, v) for d, v in parsed
-              if 0 <= (d - now).days <= horizon and v in _RISK_ORDER]
-    past_or_now = [(d, v) for d, v in parsed if d <= now]
-    if past_or_now:
-        out["ili_risk_today"] = past_or_now[-1][1]
-    elif parsed:
-        out["ili_risk_today"] = parsed[0][1]
+    past_or_now = [(d, n, c) for d, n, c in series if d <= now]
+    current = past_or_now[-1] if past_or_now else series[0]
+    out["ili_risk_today"] = current[2]
+    out["ili_risk_today_num"] = current[1]
 
+    within = [(d, n, c) for d, n, c in series if 0 <= (d - now).days <= horizon]
     if within:
-        peak = max(within, key=lambda t: _RISK_ORDER.index(t[1]))
-        out["ili_risk_peak"] = peak[1]
+        peak = max(within, key=lambda t: t[1])
+        out["ili_risk_peak"] = peak[2]
         out["ili_peak_date"] = peak[0].date().isoformat()
     return out
 
@@ -280,6 +355,11 @@ def extract_all(cell_responses, lat, lng, cfg):
     """Flatten one location's responses into canonical fields."""
     flat = {"cell_lat": lat, "cell_lng": lng}
     for hazard, resp in cell_responses.items():
+        # weather_history is raw time-series consumed directly by
+        # export_observed_temperature off the grid — it has no canonical
+        # per-location fields to flatten, so skip the extractor dispatch.
+        if hazard == "weather_history":
+            continue
         provider = cfg["hazards"][hazard]["provider"]
         fn = EXTRACTORS.get((hazard, provider))
         if fn is None:

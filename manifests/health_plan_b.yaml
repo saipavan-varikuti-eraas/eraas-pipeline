@@ -14,6 +14,7 @@ enrich:
   ili_horizon_days: 14
   ili_max_drift_km: 50
   weather_horizon_days: 7
+  history_days: 45
   cold_threshold_f: 32
   heat_threshold_f: 100
   providers:
@@ -27,10 +28,11 @@ enrich:
       include: "days,current"
   hazards:
     air_quality: { provider: ambee,           path: "/latest/by-lat-lng" }
-    pollen:      { provider: ambee,           path: "/latest/pollen/by-lat-lng" }
+    pollen:      { provider: ambee,           path: "/v3/pollen/latest" }
     wildfire:    { provider: ambee,           path: "/fire/latest/by-lat-lng" }
     ili:         { provider: ambee,           path: "/ili/forecast/by-lat-lng" }
-    weather:     { provider: visual_crossing, path: "/timeline/{location}" }
+    weather:         { provider: visual_crossing, path: "/timeline/{location}" }
+    weather_history: { provider: visual_crossing, path: "/timeline/{location}/{start}/{end}" }
 
 schedule:
   cron: "0 4 * * *"

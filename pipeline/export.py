@@ -165,8 +165,97 @@ def export_extremeheat(grid, env_by_cell, manifest):
         ("feelslike_max","FLOAT"),("feelslike_min","FLOAT"),("humidity","FLOAT"),
         ("heat_risk","STRING"),("extreme_heat_threshold","FLOAT"),("record_inserted_at","TIMESTAMP")]]
     c = bigquery.Client(project=p)
-    tid = _write(c, p, f"extremeheat_forecast_{e}", "extremeheat_data", s, rows, "WRITE_TRUNCATE", r)
+    dedup = f"DELETE FROM `{p}.extremeheat_forecast_{e}.extremeheat_data` WHERE forecast_run_date='{rd}' AND city IS NOT NULL"
+    tid = _write(c, p, f"extremeheat_forecast_{e}", "extremeheat_data", s, rows, "WRITE_APPEND", r, dedup)
     print(f"  BQ: {len(rows)} heat rows -> {tid}")
+
+# 4b
+def export_observed_temperature(grid, env_by_cell, manifest):
+    """Observed (actual) temperature history → extremeheat_forecast_{env}.
+
+    Sourced from the weather_history grid key (VC Timeline date-range pull).
+    These are REAL past observations, keyed by their own date, with NO
+    forecast_run_date — that's what distinguishes an actual from a forecast.
+    Rows for today may be a nowcast; that's the intended actual/forecast
+    handoff point. TRUNCATE: each run re-fetches the whole 45-day window.
+    """
+    p, e, r = _cfg()
+    now = datetime.now(timezone.utc).isoformat()
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    rows = []
+    for lat, lng, cell, env in _grid_iter(grid, env_by_cell):
+        hist = cell.get("weather_history", {})
+        for d in (hist.get("days") or []):
+            dt = d.get("datetime")
+            if not dt:
+                continue
+            # guard: never let a forward statistical row leak in as "actual"
+            if dt > today:
+                continue
+            rows.append({"date": dt, "city": env.get("aq_observed_city", ""),
+                "state": env.get("aq_observed_state", ""), "lat": lat, "lng": lng,
+                "actual_temp_max": _f(d.get("tempmax")),
+                "actual_feelslike_max": _f(d.get("feelslikemax")),
+                "actual_feelslike_min": _f(d.get("feelslikemin")),
+                "actual_humidity": _f(d.get("humidity")),
+                "record_inserted_at": now})
+    if not rows:
+        print("  BQ: 0 observed rows (no weather_history in grid)")
+        return
+    s = [bigquery.SchemaField(k, t) for k, t in [("date", "DATE"),
+        ("city", "STRING"), ("state", "STRING"), ("lat", "FLOAT"), ("lng", "FLOAT"),
+        ("actual_temp_max", "FLOAT"), ("actual_feelslike_max", "FLOAT"),
+        ("actual_feelslike_min", "FLOAT"), ("actual_humidity", "FLOAT"),
+        ("record_inserted_at", "TIMESTAMP")]]
+    c = bigquery.Client(project=p)
+    tid = _write(c, p, f"extremeheat_forecast_{e}", "observed_temperature",
+                 s, rows, "WRITE_TRUNCATE", r)
+    print(f"  BQ: {len(rows)} observed rows -> {tid}")
+
+
+# 4c
+def export_ili_forecast(env_by_cell, manifest):
+    """ILI (flu-like illness) weekly forecast → ili_forecast_{env}.
+
+    ILI is weekly and CBSA-regional, unlike the daily point hazards. This
+    writes one row per (cell, epi_week) from the normalized ili_series the
+    extractor produces — carrying numeric risk (secondary-axis metric),
+    category (tooltip), and CBSA label. Only ili_usable cells are written,
+    respecting the drift gate. TRUNCATE: latest forecast only.
+    """
+    p, e, r = _cfg()
+    now = datetime.now(timezone.utc).isoformat()
+    rows = []
+    for v in env_by_cell.values():
+        if v.get("ili_usable") is not True:
+            continue
+        series = v.get("ili_series") or []
+        for (week_date, risk_num, risk_cat) in series:
+            rows.append({
+                "epi_week_start": week_date,
+                "lat": _f(v.get("cell_lat")), "lng": _f(v.get("cell_lng")),
+                "city": v.get("aq_observed_city", ""),
+                "state": v.get("aq_observed_state", ""),
+                "cbsa_id": v.get("ili_cbsa_id"),
+                "cbsa_name": v.get("ili_cbsa_name"),
+                "ili_risk": _i(risk_num),
+                "ili_risk_category": risk_cat,
+                "grid_drift_km": _f(v.get("ili_grid_drift_km")),
+                "record_inserted_at": now})
+    if not rows:
+        print("  BQ: 0 ILI rows (none usable after drift gate)")
+        return
+    s = [bigquery.SchemaField(k, t) for k, t in [
+        ("epi_week_start", "DATE"), ("lat", "FLOAT"), ("lng", "FLOAT"),
+        ("city", "STRING"), ("state", "STRING"), ("cbsa_id", "STRING"),
+        ("cbsa_name", "STRING"), ("ili_risk", "INTEGER"),
+        ("ili_risk_category", "STRING"), ("grid_drift_km", "FLOAT"),
+        ("record_inserted_at", "TIMESTAMP")]]
+    c = bigquery.Client(project=p)
+    tid = _write(c, p, f"ili_forecast_{e}", "ili_weekly_forecast",
+                 s, rows, "WRITE_TRUNCATE", r)
+    print(f"  BQ: {len(rows)} ILI rows -> {tid}")
+
 
 # 5
 def export_severe_weather(grid, env_by_cell, manifest):
@@ -191,7 +280,8 @@ def export_severe_weather(grid, env_by_cell, manifest):
         ("wind_gust","FLOAT"),("severe_risk","FLOAT"),("conditions","STRING"),("description","STRING"),
         ("visibility","FLOAT"),("record_inserted_at","TIMESTAMP")]]
     c = bigquery.Client(project=p)
-    tid = _write(c, p, f"severe_weather_{e}", "severe_weather_data", s, rows, "WRITE_TRUNCATE", r)
+    dedup = f"DELETE FROM `{p}.severe_weather_{e}.severe_weather_data` WHERE forecast_run_date='{rd}' AND city IS NOT NULL"
+    tid = _write(c, p, f"severe_weather_{e}", "severe_weather_data", s, rows, "WRITE_APPEND", r, dedup)
     print(f"  BQ: {len(rows)} severe rows -> {tid}")
 
 # 6
@@ -208,7 +298,8 @@ def export_wildfire_snapshot(env_by_cell, manifest):
         ("city","STRING"),("state","STRING"),("max_fwi","FLOAT"),("nearest_fire_km","FLOAT"),
         ("days_since_last_fire","INTEGER"),("fire_count","INTEGER"),("record_inserted_at","TIMESTAMP")]]
     c = bigquery.Client(project=p)
-    tid = _write(c, p, f"wildfire_forecast_{e}", "wildfire_daily_snapshot", s, rows, "WRITE_TRUNCATE", r)
+    dedup = f"DELETE FROM `{p}.wildfire_forecast_{e}.wildfire_daily_snapshot` WHERE date='{td}'"
+    tid = _write(c, p, f"wildfire_forecast_{e}", "wildfire_daily_snapshot", s, rows, "WRITE_APPEND", r, dedup)
     print(f"  BQ: {len(rows)} wildfire rows -> {tid}")
 
 # 7
@@ -226,7 +317,8 @@ def export_aqi_snapshot(env_by_cell, manifest):
         ("pm25","FLOAT"),("pm10","FLOAT"),("no2","FLOAT"),("ozone","FLOAT"),
         ("record_inserted_at","TIMESTAMP")]]
     c = bigquery.Client(project=p)
-    tid = _write(c, p, f"airquality_forecast_{e}", "aqi_daily_snapshot", s, rows, "WRITE_TRUNCATE", r)
+    dedup = f"DELETE FROM `{p}.airquality_forecast_{e}.aqi_daily_snapshot` WHERE date='{td}'"
+    tid = _write(c, p, f"airquality_forecast_{e}", "aqi_daily_snapshot", s, rows, "WRITE_APPEND", r, dedup)
     print(f"  BQ: {len(rows)} AQI rows -> {tid}")
 
 # All in one call
@@ -235,6 +327,8 @@ def export_all(scored, grid, env_by_cell, manifest):
     export_daily_forecast(grid, env_by_cell, manifest)
     export_location_snapshot(env_by_cell, manifest)
     export_extremeheat(grid, env_by_cell, manifest)
+    export_observed_temperature(grid, env_by_cell, manifest)
+    export_ili_forecast(env_by_cell, manifest)
     export_severe_weather(grid, env_by_cell, manifest)
     export_wildfire_snapshot(env_by_cell, manifest)
     export_aqi_snapshot(env_by_cell, manifest)
